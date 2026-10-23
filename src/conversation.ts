@@ -37,6 +37,9 @@ export class Conversation {
 	/** Short transcript refs (#N) -> QQ message ids, for quote replies. */
 	private refs = new Map<number, string>();
 	private refSeq = 0;
+	/** Messages the bot sent: s-number -> QQ message id + send time, for recall. */
+	private sent = new Map<number, { id: string; at: number; preview: string }>();
+	private sentSeq = 0;
 	private sentThisRun = 0;
 	private lastThinking?: string;
 	readonly stickers: StickerLibrary;
@@ -283,11 +286,32 @@ export class Conversation {
 		return { seq: Math.floor(Math.random() * 65535) + 1 };
 	}
 
-	async sendText(text: string, replyTo?: number): Promise<boolean> {
+	async sendText(text: string, replyTo?: number): Promise<{ quoted: boolean; sid?: number }> {
 		const quoteId = replyTo ? this.refs.get(replyTo) : undefined;
 		const { msgId, seq } = this.nextSeq();
-		await this.qq.sendText(this.type, this.convId, this.encodeMentions(text), msgId ?? "", seq, quoteId);
-		return !!quoteId;
+		const res = await this.qq.sendText(this.type, this.convId, this.encodeMentions(text), msgId ?? "", seq, quoteId);
+		const sid = this.remember(res, text);
+		return { quoted: !!quoteId, sid };
+	}
+
+	/** Remember a sent message id so it can be recalled; returns its s-number. */
+	private remember(res: Record<string, unknown>, preview: string): number | undefined {
+		if (typeof res.id !== "string") return undefined;
+		const n = ++this.sentSeq;
+		this.sent.set(n, { id: res.id, at: Date.now(), preview: preview.slice(0, 40) });
+		if (this.sent.size > 50) this.sent.delete(this.sent.keys().next().value!);
+		return n;
+	}
+
+	async recall(n?: number): Promise<string> {
+		const key = n ?? this.sentSeq;
+		const m = this.sent.get(key);
+		if (!m) return `no sent message s${key}`;
+		if (Date.now() - m.at > 2 * 60 * 1000) return `s${key} is older than 2 minutes; QQ no longer allows recalling it`;
+		await this.qq.recall(this.type, this.convId, m.id);
+		this.sent.delete(key);
+		this.log(`[${this.convId.slice(0, 8)}] recalled s${key}: ${m.preview}`);
+		return `recalled s${key}`;
 	}
 
 	/**
@@ -304,13 +328,14 @@ export class Conversation {
 			.replace(/@(?=\s|$)/g, "");
 	}
 
-	async sendLocal(path: string, kind: "image" | "file" | "video"): Promise<void> {
+	async sendLocal(path: string, kind: "image" | "file" | "video"): Promise<number | undefined> {
 		const abs = resolve(this.dir, path);
 		const data = readFileSync(abs);
 		const fileType = kind === "image" ? 1 : kind === "video" ? 2 : 4;
 		const info = await this.qq.uploadMedia(this.type, this.convId, fileType, { data: data.toString("base64") });
 		const { msgId, seq } = this.nextSeq();
-		await this.qq.sendMedia(this.type, this.convId, info, msgId ?? "", seq);
+		const res = await this.qq.sendMedia(this.type, this.convId, info, msgId ?? "", seq);
+		return this.remember(res, `[${kind} ${basename(path)}]`);
 	}
 
 	/** Simulate human typing latency between consecutive messages. */
@@ -339,9 +364,10 @@ export class Conversation {
 					const text = params.text.trim();
 					if (!text) return ok("empty message, not sent");
 					await conv.typingDelay(text);
-					const quoted = await conv.sendText(text.slice(0, 2000), params.reply_to);
+					const { quoted, sid } = await conv.sendText(text.slice(0, 2000), params.reply_to);
 					conv.log(`[${conv.convId.slice(0, 8)}] -> ${conv.cfg.name}${quoted ? ` (re #${params.reply_to})` : ""}: ${text.slice(0, 100)}`);
-					return ok(params.reply_to && !quoted ? "sent (quote target unknown, sent as normal message)" : "sent");
+					const tag = sid ? ` as s${sid}` : "";
+					return ok(params.reply_to && !quoted ? `sent${tag} (quote target unknown, sent as normal message)` : `sent${tag}`);
 				},
 			}),
 			defineTool({
@@ -350,8 +376,18 @@ export class Conversation {
 				description: "Send a local image (png/jpg/gif) to the current QQ chat. path may be relative to the working directory or absolute.",
 				parameters: Type.Object({ path: Type.String() }),
 				async execute(_id, params) {
-					await conv.sendLocal(params.path, "image");
-					return ok("image sent");
+					const sid = await conv.sendLocal(params.path, "image");
+					return ok(`image sent${sid ? ` as s${sid}` : ""}`);
+				},
+			}),
+			defineTool({
+				name: "qq_recall",
+				label: "QQ Recall",
+				description:
+					"Recall (unsend) a message you sent, like a person deleting a typo or a regretted message. Use the s-number from the send result; omit to recall your latest message. Only works within 2 minutes.",
+				parameters: Type.Object({ sent: Type.Optional(Type.Integer({ description: "s-number of your sent message" })) }),
+				async execute(_id, params) {
+					return ok(await conv.recall(params.sent));
 				},
 			}),
 			defineTool({
@@ -375,9 +411,9 @@ export class Conversation {
 					const s = conv.stickers.find(params.name);
 					if (!s) return ok("sticker not found; try qq_find_sticker");
 					await conv.typingDelay("");
-					await conv.sendLocal(conv.stickers.path(s), "image");
+					const sid = await conv.sendLocal(conv.stickers.path(s), "image");
 					conv.log(`[${conv.convId.slice(0, 8)}] -> ${conv.cfg.name}: [sticker ${s.name}]`);
-					return ok(`sent sticker ${s.name}`);
+					return ok(`sent sticker ${s.name}${sid ? ` as s${sid}` : ""}`);
 				},
 			}),
 			defineTool({
@@ -408,8 +444,8 @@ export class Conversation {
 				parameters: Type.Object({ path: Type.String() }),
 				async execute(_id, params) {
 					const kind = /\.mp4$/i.test(params.path) ? "video" : "file";
-					await conv.sendLocal(params.path, kind);
-					return ok("file sent");
+					const sid = await conv.sendLocal(params.path, kind);
+					return ok(`file sent${sid ? ` as s${sid}` : ""}`);
 				},
 			}),
 		];

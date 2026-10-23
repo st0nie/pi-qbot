@@ -108,6 +108,11 @@ export class QQClient {
 		});
 	}
 
+	/** Recall (delete) a message the bot sent. QQ only allows this within ~2 minutes. */
+	recall(type: ConvType, convId: string, messageId: string) {
+		return this.request("DELETE", `${this.prefix(type, convId)}/messages/${encodeURIComponent(messageId)}`);
+	}
+
 	/** Upload media (1 image, 2 video, 3 voice/silk, 4 file) without sending it. */
 	async uploadMedia(type: ConvType, convId: string, fileType: 1 | 2 | 3 | 4, src: { url?: string; data?: string }) {
 		const body = await this.request(
