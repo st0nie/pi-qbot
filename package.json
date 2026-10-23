@@ -1,0 +1,28 @@
+{
+  "name": "pi-qbot",
+  "version": "0.1.0",
+  "description": "Official QQ Bot bridge for pi: one directory + pi session per QQ group, human-like chat",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "qqbot"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@types/node": "22.15.0",
+    "typescript": "5.8.3"
+  }
+}

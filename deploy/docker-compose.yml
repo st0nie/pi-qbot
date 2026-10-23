@@ -1,0 +1,37 @@
+services:
+  pi-qbot:
+    build:
+      context: ./src
+      # Build through the host's mihomo proxy (published on 0.0.0.0:8443), reached
+      # via the docker0 gateway. HTTP(S)_PROXY are predefined build args, not baked in.
+      args:
+        HTTP_PROXY: http://172.17.0.1:8443
+        HTTPS_PROXY: http://172.17.0.1:8443
+        http_proxy: http://172.17.0.1:8443
+        https_proxy: http://172.17.0.1:8443
+    image: pi-qbot:latest
+    container_name: pi-qbot
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+      QQBOT_MODEL: cliproxyapi/kimi-k2.8-code
+      QQBOT_THINKING: low
+    volumes:
+      # Bot root: qqbot.json, groups/, users/, stickers/
+      - ./data:/data
+      # pi agent config (CPA provider, models, trust)
+      - ./pi-agent/cliproxyapi.json:/root/.pi/agent/cliproxyapi.json
+      - ./pi-agent/auth.json:/root/.pi/agent/auth.json
+      - ./pi-agent/models.json:/root/.pi/agent/models.json
+      - ./pi-agent/trust.json:/root/.pi/agent/trust.json
+      # realmem config + memory DB (long-term memory survives recreate)
+      - ./pi-agent/realmem:/root/.pi/agent/realmem
+      # magic-context: config, shared DB and local embedding model
+      - ./cortexkit/config:/root/.config/cortexkit
+      - ./cortexkit/data:/root/.local/share/cortexkit
+      # rpiv-web-tools config (search provider + API key)
+      - ./pi-agent/rpiv-web-tools:/root/.config/rpiv-web-tools
+      # Entrypoint from the source tree, so launch tweaks don't need a rebuild
+      - ./src/deploy/entrypoint.sh:/usr/local/bin/entrypoint.sh:ro
+      # Extension source, so code updates only need a restart
+      - ./src/src:/opt/pi-qbot/src:ro
