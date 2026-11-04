@@ -14,8 +14,8 @@ services:
     restart: unless-stopped
     environment:
       TZ: Asia/Shanghai
-      QQBOT_MODEL: cliproxyapi/kimi-k2.8-code
-      QQBOT_THINKING: low
+      QQBOT_MODEL: cliproxyapi/gpt-6.1-terra
+      QQBOT_THINKING: high
     volumes:
       # Bot root: qqbot.json, groups/, users/, stickers/
       - ./data:/data
@@ -24,14 +24,12 @@ services:
       - ./pi-agent/auth.json:/root/.pi/agent/auth.json
       - ./pi-agent/models.json:/root/.pi/agent/models.json
       - ./pi-agent/trust.json:/root/.pi/agent/trust.json
-      # realmem config + memory DB (long-term memory survives recreate)
-      - ./pi-agent/realmem:/root/.pi/agent/realmem
-      # magic-context: config, shared DB and local embedding model
-      - ./cortexkit/config:/root/.config/cortexkit
-      - ./cortexkit/data:/root/.local/share/cortexkit
+      # realctx config + memory DB (long-term memory survives recreate)
+      - ./pi-agent/realctx:/root/.pi/agent/realctx
       # rpiv-web-tools config (search provider + API key)
       - ./pi-agent/rpiv-web-tools:/root/.config/rpiv-web-tools
       # Entrypoint from the source tree, so launch tweaks don't need a rebuild
       - ./src/deploy/entrypoint.sh:/usr/local/bin/entrypoint.sh:ro
-      # Extension source, so code updates only need a restart
+      # Extension source and bundled skills, so updates only need a restart
       - ./src/src:/opt/pi-qbot/src:ro
+      - ./src/skills:/opt/pi-qbot/skills:ro

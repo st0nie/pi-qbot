@@ -23,6 +23,22 @@ const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const MAX_FILE_BYTES = 30 * 1024 * 1024;
 const PASSIVE_WINDOW_MS = 4.5 * 60 * 1000;
 
+const BUILTIN_SKILLS_DIR = resolve(import.meta.dirname, "../skills");
+const BUILTIN_SKILL_NAMES = ["qq-quote-reply", "qq-mention"];
+export function builtinSkillPaths(): string[] {
+	return BUILTIN_SKILL_NAMES.map((name) => join(BUILTIN_SKILLS_DIR, name)).filter((p) => existsSync(p));
+}
+
+export interface RefEntry {
+	id: string;
+	at: number;
+	seq: number;
+	authorId: string;
+	authorName?: string;
+	mentionedMe: boolean;
+	text: string;
+}
+
 /** One QQ group / private chat = one directory = one persistent pi session. */
 export class Conversation {
 	readonly dir: string;
@@ -31,11 +47,11 @@ export class Conversation {
 	private pending: { lines: string[]; images: Image[] } = { lines: [], images: [] };
 	private timer?: ReturnType<typeof setTimeout>;
 	private running = false;
-	/** Latest inbound msg used as passive-reply anchor */
-	private anchor?: { id: string; at: number; seq: number };
+	/** Latest inbound msg used as default passive-reply anchor */
+	private anchor?: RefEntry;
 	private names = new Map<string, string>();
-	/** Short transcript refs (#N) -> QQ message ids, for quote replies. */
-	private refs = new Map<number, string>();
+	/** Short transcript refs (#N) -> inbound message metadata, for quote replies and @ resolution. */
+	private refs = new Map<number, RefEntry>();
 	private refSeq = 0;
 	/** Messages the bot sent: s-number -> QQ message id + send time, for recall. */
 	private sent = new Map<number, { id: string; at: number; preview: string }>();
@@ -61,23 +77,32 @@ export class Conversation {
 	// ---------- inbound ----------
 
 	async push(m: InboundMessage): Promise<void> {
-		this.anchor = { id: m.id, at: Date.now(), seq: 1 };
 		if (m.authorName) this.names.set(m.authorId, m.authorName);
 		for (const men of m.mentions) if (men.name && !men.isMe) this.names.set(men.id, men.name);
 		const ref = ++this.refSeq;
-		this.refs.set(ref, m.id);
+		const entry: RefEntry = {
+			id: m.id,
+			at: Date.now(),
+			seq: 1,
+			authorId: m.authorId,
+			authorName: m.authorName,
+			mentionedMe: m.mentionedMe,
+			text: m.text,
+		};
+		this.anchor = entry;
+		this.refs.set(ref, entry);
 		if (this.refs.size > 500) this.refs.delete(this.refs.keys().next().value!);
 		const line = await this.format(m, ref);
 		this.pending.lines.push(line.text);
 		this.log(`[${this.convId.slice(0, 8)}] ${line.text.slice(0, 140)}`);
 		this.pending.images.push(...line.images);
-		// Answer faster when directly addressed; otherwise wait a bit to batch chatter.
-		const delay = m.mentionedMe || this.type === "c2c" ? 600 : this.cfg.debounceMs;
+		// Answer faster when directly addressed or quoted; otherwise wait a bit to batch chatter.
+		const delay = m.mentionedMe || line.quotedMe || this.type === "c2c" ? 600 : this.cfg.debounceMs;
 		if (this.timer) clearTimeout(this.timer);
 		this.timer = setTimeout(() => void this.flush(), delay);
 	}
 
-	private async format(m: InboundMessage, ref: number): Promise<{ text: string; images: Image[] }> {
+	private async format(m: InboundMessage, ref: number): Promise<{ text: string; images: Image[]; quotedMe: boolean }> {
 		const time = new Date(m.timestamp).toLocaleTimeString("en-GB", { hour12: false, timeZone: "Asia/Shanghai" });
 		let content = decodeFaces(m.text)
 			.replace(/<@!?([^>]+)>/g, (_all, id: string) => {
@@ -123,12 +148,33 @@ export class Conversation {
 				this.log(`attachment download failed: ${(e as Error).message}`);
 			}
 		}
+		let quoteText = m.quote;
+		let quotedMe = false;
+		let quotedRef: number | undefined;
+		if (m.quoteMsgId) {
+			const sentHit = [...this.sent.values()].find((s) => s.id === m.quoteMsgId);
+			if (sentHit) {
+				quotedMe = true;
+				quoteText ??= `${this.cfg.name}: ${sentHit.preview}`;
+			} else {
+				const refHit = [...this.refs.entries()].find(([k, v]) => k !== ref && v.id === m.quoteMsgId);
+				if (refHit) {
+					quotedRef = refHit[0];
+					const r = refHit[1];
+					quoteText ??= `${r.authorName ?? this.names.get(r.authorId) ?? "member"}: ${r.text}`;
+				}
+			}
+		}
+		if (!quotedMe && quoteText && this.cfg.name && quoteText.startsWith(`${this.cfg.name}:`)) {
+			quotedMe = true;
+		}
 		const who =
 			this.type === "group"
 				? `${m.authorName ?? "member"}(${m.authorId.slice(0, 8)}${m.authorRole && m.authorRole !== "member" ? `,${m.authorRole === "owner" ? "owner" : "admin"}` : ""}${m.authorIsBot ? ",bot" : ""})`
 				: (m.authorName ?? "friend");
-		const flags = `${m.mentionedMe ? " (@me)" : ""}${m.quote ? ` (quote: ${decodeFaces(m.quote).replace(/\s+/g, " ").slice(0, 200)})` : ""}`;
-		return { text: `[${time}] #${ref} ${who}${flags}: ${content.trim() || "(empty)"}`, images };
+		const quoteLabel = quotedMe ? "quote @me" : quotedRef ? `quote #${quotedRef}` : "quote";
+		const flags = `${m.mentionedMe ? " (@me)" : ""}${quoteText ? ` (${quoteLabel}: ${decodeFaces(quoteText).replace(/\s+/g, " ").slice(0, 200)})` : ""}`;
+		return { text: `[${time}] #${ref} ${who}${flags}: ${content.trim() || "(empty)"}`, images, quotedMe };
 	}
 
 	private async flush(): Promise<void> {
@@ -203,11 +249,16 @@ export class Conversation {
 			cwd: this.dir,
 			agentDir,
 			settingsManager,
+			additionalSkillPaths: builtinSkillPaths(),
 			appendSystemPrompt: [personaPrompt(this.cfg, this.type)],
 			// Never recursively load this bridge inside conversation sessions.
 			extensionsOverride: (base) => ({
 				...base,
 				extensions: base.extensions.filter((e) => !isSelf(e.path) && !isSelf(e.resolvedPath)),
+			}),
+			skillsOverride: (base) => ({
+				skills: base.skills.filter((s) => s.name !== "run-workflow"),
+				diagnostics: base.diagnostics,
 			}),
 			agentsFilesOverride: (base) => {
 				const files = base.agentsFiles.filter((f) => resolve(f.path) !== memoPath);
@@ -280,18 +331,22 @@ export class Conversation {
 
 	// ---------- outbound ----------
 
-	private nextSeq(): { msgId?: string; seq: number } {
+	private nextSeq(target?: RefEntry): { msgId?: string; seq: number } {
+		const now = Date.now();
+		if (target && now - target.at < PASSIVE_WINDOW_MS) return { msgId: target.id, seq: target.seq++ };
 		const a = this.anchor;
-		if (a && Date.now() - a.at < PASSIVE_WINDOW_MS) return { msgId: a.id, seq: a.seq++ };
+		if (a && now - a.at < PASSIVE_WINDOW_MS) return { msgId: a.id, seq: a.seq++ };
 		return { seq: Math.floor(Math.random() * 65535) + 1 };
 	}
 
-	async sendText(text: string, replyTo?: number): Promise<{ quoted: boolean; sid?: number }> {
-		const quoteId = replyTo ? this.refs.get(replyTo) : undefined;
-		const { msgId, seq } = this.nextSeq();
-		const res = await this.qq.sendText(this.type, this.convId, this.encodeMentions(text), msgId ?? "", seq, quoteId);
-		const sid = this.remember(res, text);
-		return { quoted: !!quoteId, sid };
+	async sendText(text: string, replyTo?: number, at?: string | string[]): Promise<{ quoted: boolean; sid?: number; text: string }> {
+		const target = replyTo ? this.refs.get(replyTo) : undefined;
+		const quoteId = target?.id;
+		const finalText = this.applyAtMentions(text, at);
+		const { msgId, seq } = this.nextSeq(target);
+		const res = await this.qq.sendText(this.type, this.convId, finalText, msgId ?? "", seq, quoteId);
+		const sid = this.remember(res, finalText);
+		return { quoted: !!quoteId, sid, text: finalText };
 	}
 
 	/** Remember a sent message id so it can be recalled; returns its s-number. */
@@ -314,18 +369,57 @@ export class Conversation {
 		return `recalled s${key}`;
 	}
 
+	/** Resolve a nickname, @nickname, nickname(id), #N message ref, or hex id prefix to a clean display name. */
+	resolveName(raw: string): string {
+		const trimmed = raw.trim().replace(/^@+/, "").trim();
+		if (!trimmed) return "";
+		const refMatch = /^#(\d+)$/.exec(trimmed);
+		if (refMatch) {
+			const ref = this.refs.get(Number(refMatch[1]));
+			if (ref) return ref.authorName ?? this.names.get(ref.authorId) ?? ref.authorId.slice(0, 8);
+		}
+		const stripped = trimmed.replace(/\([0-9a-fA-F]{6,}(?:,[a-z]+)*\)$/, "").trim();
+		const byId =
+			this.names.get(stripped) ??
+			(/^[0-9a-fA-F]{6,}$/.test(stripped)
+				? [...this.names].find(([k]) => k.toLowerCase().startsWith(stripped.toLowerCase()))?.[1]
+				: undefined);
+		return byId ?? stripped;
+	}
+
 	/**
 	 * QQ group bots can't render real @ tags in text messages (both `<qqbot-at-user />`
 	 * and `<@openid>` show up literally, tested), so mentions are sent as plain
-	 * `@nickname` text. Any raw tag the model copies from history is turned back into a name.
+	 * `@nickname` text. Any raw tag, #N ref, or internal id suffix the model copies is turned into `@nickname`.
 	 */
 	encodeMentions(text: string): string {
-		const name = (id: string) => this.names.get(id) ?? [...this.names].find(([k]) => k.startsWith(id))?.[1];
+		const name = (id: string) =>
+			this.names.get(id) ?? [...this.names].find(([k]) => k.toLowerCase().startsWith(id.toLowerCase()))?.[1];
 		return text
 			.replace(/<qqbot-at-user\s+id="([^"]*)"\s*\/?>/g, (_a, id: string) => `@${name(id) ?? ""}`)
 			.replace(/<@!?([0-9A-Fa-f]{6,})>/g, (_a, id: string) => `@${name(id) ?? ""}`)
-			.replace(/@\[([^\]\n]{1,64})\]/g, (_a, key: string) => `@${name(key) ?? key}`)
+			.replace(/@\[([^\]\n]{1,64})\]/g, (_a, key: string) => `@${this.resolveName(key)}`)
+			.replace(/@#(\d+)\b/g, (all, num: string) => {
+				const r = this.refs.get(Number(num));
+				const n = r ? (r.authorName ?? name(r.authorId)) : undefined;
+				return n ? `@${n}` : all;
+			})
+			.replace(/@([^\s@()]{1,64})\([0-9a-fA-F]{6,}(?:,[a-z]+)*\)/g, (_a, nick: string) => `@${nick}`)
+			.replace(/@([0-9A-Fa-f]{8,32})\b/g, (all, hex: string) => {
+				const n = name(hex);
+				return n ? `@${n}` : all;
+			})
 			.replace(/@(?=\s|$)/g, "");
+	}
+
+	/** Prepend @nickname mentions requested via the `at` parameter without duplicating mentions already in text. */
+	applyAtMentions(text: string, at?: string | string[]): string {
+		const encoded = this.encodeMentions(text);
+		if (!at || this.type === "c2c") return encoded;
+		const list = (Array.isArray(at) ? at : [at]).map((x) => this.resolveName(x)).filter(Boolean);
+		const missing = [...new Set(list)].filter((n) => !encoded.includes(`@${n}`));
+		if (!missing.length) return encoded;
+		return `${missing.map((n) => `@${n}`).join(" ")} ${encoded}`.trim();
 	}
 
 	async sendLocal(path: string, kind: "image" | "file" | "video"): Promise<number | undefined> {
@@ -359,12 +453,18 @@ export class Conversation {
 					reply_to: Type.Optional(
 						Type.Integer({ description: "Quote-reply a message: its #N number from the chat log. Omit for a normal message." }),
 					),
+					at: Type.Optional(
+						Type.Union([
+							Type.String({ description: "Nickname or #N message ref of a member to @-mention in a group chat." }),
+							Type.Array(Type.String(), { description: "Nicknames or #N message refs of members to @-mention in a group chat." }),
+						]),
+					),
 				}),
 				async execute(_id, params) {
-					const text = params.text.trim();
-					if (!text) return ok("empty message, not sent");
-					await conv.typingDelay(text);
-					const { quoted, sid } = await conv.sendText(text.slice(0, 2000), params.reply_to);
+					const raw = params.text.trim();
+					if (!raw) return ok("empty message, not sent");
+					await conv.typingDelay(raw);
+					const { quoted, sid, text } = await conv.sendText(raw.slice(0, 2000), params.reply_to, params.at);
 					conv.log(`[${conv.convId.slice(0, 8)}] -> ${conv.cfg.name}${quoted ? ` (re #${params.reply_to})` : ""}: ${text.slice(0, 100)}`);
 					const tag = sid ? ` as s${sid}` : "";
 					return ok(params.reply_to && !quoted ? `sent${tag} (quote target unknown, sent as normal message)` : `sent${tag}`);
@@ -490,7 +590,7 @@ function fetchTrustedMedia(raw: string): Promise<Response> {
 }
 
 /** Turn QQ face/sticker markup like <faceType=6,faceId="0",ext="base64"> into readable text. */
-function decodeFaces(text: string): string {
+export function decodeFaces(text: string): string {
 	return text.replace(/<faceType=[^>]*>/g, (raw) => {
 		const ext = /ext="([^"]*)"/.exec(raw)?.[1];
 		let name = "";
@@ -499,6 +599,7 @@ function decodeFaces(text: string): string {
 		} catch {
 			/* ignore malformed ext */
 		}
+		name = name.replace(/^\[+|\]+$/g, "").trim();
 		return name ? `[sticker:${name}]` : "[sticker]";
 	});
 }

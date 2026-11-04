@@ -11,6 +11,10 @@
   "pi": {
     "extensions": [
       "./src/index.ts"
+    ],
+    "skills": [
+      "./skills/qq-quote-reply",
+      "./skills/qq-mention"
     ]
   },
   "scripts": {

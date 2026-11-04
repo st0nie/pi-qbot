@@ -16,22 +16,20 @@ ENV PI_SKIP_VERSION_CHECK=1 \
     PI_CODING_AGENT_DIR=/root/.pi/agent \
     TERM=xterm-256color
 
-# Extensions baked into the image: CPA provider, realmem, empty-text guard, magic-context,
-# web tools, todo, background tasks.
-# Pi compaction is off: magic-context manages context itself.
+# Extensions baked into the image: CPA provider, realctx, realtasks, web tools, todo.
+# Pi compaction is off: realctx manages context itself.
 RUN pi install npm:@router-for-me/pi-cliproxyapi-provider \
- && pi install git:github.com/WtzLAS/realmem \
- && pi install git:github.com/st0nie/pi-empty-text-guard \
- && pi install npm:@cortexkit/pi-magic-context \
+ && pi install git:github.com/WtzLAS/realctx \
+ && pi install git:github.com/st0nie/realtasks \
  && pi install npm:@juicesharp/rpiv-web-tools \
  && pi install npm:@juicesharp/rpiv-todo \
- && pi install npm:pi-background-tasks \
  && jq '.compaction = {"enabled": false} | .steeringMode = "all" | .followUpMode = "all"' \
       /root/.pi/agent/settings.json > /tmp/s.json && mv /tmp/s.json /root/.pi/agent/settings.json
 
 # The qqbot extension itself (loaded via `-e`, never by the per-group sessions).
 COPY package.json tsconfig.json /opt/pi-qbot/
 COPY src /opt/pi-qbot/src
+COPY skills /opt/pi-qbot/skills
 COPY scripts /opt/pi-qbot/scripts
 
 COPY deploy/entrypoint.sh /usr/local/bin/entrypoint.sh

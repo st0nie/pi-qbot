@@ -15,7 +15,7 @@ A [pi](https://github.com/earendil-works/pi) extension that puts a pi agent into
   - Received images and files are saved to `inbox/`. The model opens them with `read` only when it cares.
   - The bot can send images and files.
   - Voice messages arrive with QQ's ASR text, and quoted messages are decoded.
-- **Quote replies.** Each transcript line carries a `#N` number. `qq_send` accepts `reply_to: N`, which is sent as a `message_reference`.
+- **Quote replies & `@` mentions.** Each transcript line carries a `#N` number. `qq_send` accepts `reply_to: N` (sent as a `message_reference` and anchored to `#N` when within the passive window) and `at` (`"nickname"` or `"#N"`). Bundled skills (`qq-quote-reply`, `qq-mention`) teach the model when and how to quote-reply and `@`-mention.
 - **Stickers.** A library in `stickers/` is shared by all chats. The tools `qq_find_sticker`, `qq_send_sticker` and `qq_save_sticker` let the bot collect memes from chats, and `scripts/import_tg_stickers.py` imports Telegram sticker packs.
 - **Follows the host.** Chat sessions use the host pi's model and thinking level, and live `/model` or thinking switches propagate to every chat.
 
@@ -116,7 +116,7 @@ The extension source and the entrypoint are bind-mounted, so code changes only n
 
 - **No real @ in groups.** Both `<qqbot-at-user id="…" />` (the documented format) and `<@openid>` render as literal text in group chats. The bot writes `@nickname` as plain text instead.
 - **QQ adds an automatic @.** When the bot replies to a message that @-mentioned it, QQ itself prepends or appends `@sender`, for text and media alike.
-- **No native QQ faces.** QQ faces can't be sent in groups. The bot uses Unicode emoji or image stickers.
+- **No native QQ faces or poke events.** QQ faces can't be sent in groups (the bot uses Unicode emoji or image stickers), and double-click avatar pokes ("拍一拍" / "戳一戳") are never pushed to official bots.
 - **Passive replies only.** A passive reply must anchor to a received message within 5 minutes. Proactive group messages are limited to 4 per month.
 - **URLs need allowlisting.** Messages containing URLs need the domain allowlisted in the q.qq.com console.
 

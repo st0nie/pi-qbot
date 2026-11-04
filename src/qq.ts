@@ -34,6 +34,8 @@ export interface InboundMessage {
 	attachments: Attachment[];
 	/** Text of a quoted/referenced message, if any */
 	quote?: string;
+	/** Message ID of the quoted/referenced message, if any */
+	quoteMsgId?: string;
 	timestamp: string;
 }
 
@@ -273,13 +275,15 @@ export class QQGateway {
 					}))
 				: [];
 		const mentions: any[] = Array.isArray(d.mentions) ? d.mentions : [];
-		// Quoted / forwarded content (message_type 103 = reference)
+		// Quoted / forwarded content (message_type 103 = reference, or message_reference)
 		let quote: string | undefined;
 		const el = Array.isArray(d.msg_elements) ? d.msg_elements[0] : undefined;
 		if (el && (d.message_type === 103 || el.content)) {
 			const who = el.author?.username ? `${el.author.username}: ` : "";
 			quote = `${who}${String(el.content ?? "").trim()}`.slice(0, 500);
 		}
+		const refId = d.message_reference?.message_id ?? el?.id ?? el?.message_id;
+		const quoteMsgId = typeof refId === "string" && refId ? refId : undefined;
 		this.onMessage({
 			id: d.id,
 			type: isGroup ? "group" : "c2c",
@@ -295,6 +299,7 @@ export class QQGateway {
 			text: typeof d.content === "string" ? d.content.trim() : "",
 			attachments: [...mapAtt(d.attachments), ...(el ? mapAtt(el.attachments) : [])],
 			quote,
+			quoteMsgId,
 			timestamp: d.timestamp ?? new Date().toISOString(),
 		});
 	}
