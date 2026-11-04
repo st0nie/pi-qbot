@@ -6,7 +6,7 @@
 const API_BASE = "https://api.sgroup.qq.com";
 const SANDBOX_BASE = "https://sandbox.api.sgroup.qq.com";
 const TOKEN_URL = "https://bots.qq.com/app/getAppAccessToken";
-
+const delay = (ms: number) => new Promise((r) => setTimeout(r, Math.max(0, ms)));
 export type ConvType = "group" | "c2c";
 
 export interface Attachment {
@@ -61,6 +61,7 @@ export class QQClient {
 					method: "POST",
 					headers: { "Content-Type": "application/json" },
 					body: JSON.stringify({ appId: this.appId, clientSecret: this.secret }),
+					signal: AbortSignal.timeout(15_000),
 				});
 				const body = (await res.json()) as { access_token?: string; expires_in?: string | number; message?: string };
 				if (!body.access_token) throw new Error(`QQ auth failed (${res.status}) ${body.message ?? ""}`);
@@ -74,26 +75,55 @@ export class QQClient {
 		return this.inflight;
 	}
 
-	async request(method: string, path: string, body?: unknown, timeoutMs = 15_000): Promise<Record<string, unknown>> {
-		const res = await fetch(this.base + path, {
-			method,
-			headers: { "Content-Type": "application/json", Authorization: `QQBot ${await this.getToken()}` },
-			body: body === undefined ? undefined : JSON.stringify(body),
-			signal: AbortSignal.timeout(timeoutMs),
-		});
-		const text = await res.text();
-		let json: Record<string, unknown> = {};
-		try {
-			json = text ? JSON.parse(text) : {};
-		} catch {
-			/* non-JSON body */
-		}
-		if (!res.ok) {
-			throw new Error(`QQ ${method} ${path} -> ${res.status} code=${json.code ?? "?"} ${json.message ?? text.slice(0, 200)}`);
-		}
-		return json;
+	invalidateToken(): void {
+		this.token = undefined;
+		this.expiresAt = 0;
 	}
 
+	async request(method: string, path: string, body?: unknown, timeoutMs = 15_000): Promise<Record<string, unknown>> {
+		// Reads are safe to retry. Message POSTs are deliberately not retried after a
+		// network failure: the server may have accepted them, and retrying could double-send.
+		const attempts = method === "GET" ? 3 : 1;
+		let refreshed = false;
+		for (let attempt = 0; ; attempt++) {
+			try {
+				const res = await fetch(this.base + path, {
+					method,
+					headers: { "Content-Type": "application/json", Authorization: `QQBot ${await this.getToken()}` },
+					body: body === undefined ? undefined : JSON.stringify(body),
+					signal: AbortSignal.timeout(timeoutMs),
+				});
+				const text = await res.text();
+				let json: Record<string, unknown> = {};
+				try {
+					json = text ? JSON.parse(text) : {};
+				} catch {
+					/* non-JSON body */
+				}
+				if (res.status === 401 && !refreshed) {
+					refreshed = true;
+					this.invalidateToken();
+					continue;
+				}
+				if (!res.ok) {
+					if (attempt + 1 < attempts && (res.status === 429 || res.status >= 500)) {
+						const retryAfter = res.headers.get("retry-after");
+						const retryMs = retryAfter == null ? NaN : Number(retryAfter) * 1000;
+						await delay(Number.isFinite(retryMs) ? Math.min(10_000, Math.max(0, retryMs)) : 300 * 2 ** attempt);
+						continue;
+					}
+					throw new Error(`QQ ${method} ${path} -> ${res.status} code=${json.code ?? "?"} ${json.message ?? text.slice(0, 200)}`);
+				}
+				return json;
+			} catch (e) {
+				if (attempt + 1 < attempts && !(e instanceof Error && e.message.startsWith("QQ "))) {
+					await delay(300 * 2 ** attempt);
+					continue;
+				}
+				throw e;
+			}
+		}
+	}
 	private prefix(type: ConvType, convId: string): string {
 		return type === "group" ? `/v2/groups/${encodeURIComponent(convId)}` : `/v2/users/${encodeURIComponent(convId)}`;
 	}
@@ -131,7 +161,7 @@ export class QQClient {
 		return body.file_info;
 	}
 
-	sendMedia(type: ConvType, convId: string, fileInfo: string, msgId: string, msgSeq: number, caption = "") {
+	sendMedia(type: ConvType, convId: string, fileInfo: string, msgId: string, msgSeq: number, caption = "", quoteId?: string) {
 		return this.request("POST", `${this.prefix(type, convId)}/messages`, {
 			// Omit content when there is no caption; a placeholder renders as an extra blank line.
 			// (QQ itself prefixes "@sender" when replying to an @-message; content can't prevent it.)
@@ -140,6 +170,7 @@ export class QQClient {
 			media: { file_info: fileInfo },
 			msg_id: msgId,
 			msg_seq: msgSeq,
+			...(quoteId ? { message_reference: { message_id: quoteId, ignore_get_message_error: true } } : {}),
 		});
 	}
 }
@@ -149,10 +180,14 @@ const INTENTS = 1 << 25; // GROUP_AND_C2C_EVENT
 export class QQGateway {
 	private ws?: WebSocket;
 	private heartbeat?: ReturnType<typeof setInterval>;
+	private retryTimer?: ReturnType<typeof setTimeout>;
+	private connectTimer?: ReturnType<typeof setTimeout>;
 	private seq: number | null = null;
 	private sessionId?: string;
 	private backoff = 1000;
 	private stopped = false;
+	private opening = false;
+	private awaitingAck = false;
 	state = "idle";
 
 	constructor(
@@ -169,52 +204,89 @@ export class QQGateway {
 	stop(): void {
 		this.stopped = true;
 		if (this.heartbeat) clearInterval(this.heartbeat);
-		try {
-			this.ws?.close();
-		} catch {
-			/* ignore */
-		}
+		if (this.retryTimer) clearTimeout(this.retryTimer);
+		if (this.connectTimer) clearTimeout(this.connectTimer);
+		this.heartbeat = undefined;
+		this.retryTimer = undefined;
+		this.connectTimer = undefined;
+		const ws = this.ws;
 		this.ws = undefined;
+		if (ws) {
+			ws.onclose = null;
+			ws.onerror = null;
+			ws.onmessage = null;
+			ws.onopen = null;
+			try {
+				ws.close();
+			} catch {
+				/* ignore */
+			}
+		}
 		this.state = "stopped";
 	}
 
 	private async open(): Promise<void> {
-		if (this.stopped) return;
+		if (this.stopped || this.opening) return;
+		if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) return;
+		this.opening = true;
 		this.state = "connecting";
-		let url: string;
 		try {
-			url = String((await this.client.request("GET", "/gateway")).url);
+			const url = String((await this.client.request("GET", "/gateway")).url);
+			if (this.stopped || !url || url === "undefined") throw new Error("gateway response missing url");
+			const ws = new WebSocket(url);
+			this.ws = ws;
+			this.connectTimer = setTimeout(() => {
+				this.log("gateway connect timed out");
+				ws.close();
+			}, 20_000);
+			ws.onopen = () => {
+				if (this.connectTimer) clearTimeout(this.connectTimer);
+			};
+			ws.onmessage = (ev) => {
+				void this.handle(String(ev.data)).catch((e) => {
+					this.log(`gateway packet failed: ${(e as Error).message}`);
+					ws.close();
+				});
+			};
+			ws.onclose = (ev) => {
+				if (this.ws !== ws) return;
+				if (this.heartbeat) clearInterval(this.heartbeat);
+				if (this.connectTimer) clearTimeout(this.connectTimer);
+				this.ws = undefined;
+				this.awaitingAck = false;
+				this.log(`gateway closed ${ev.code} ${ev.reason ?? ""}`);
+				// Invalid sessions cannot be resumed. Auth failures also need a fresh token.
+				if ([4004, 4006, 4007, 4009, ...Array.from({ length: 14 }, (_, i) => 4900 + i)].includes(ev.code)) {
+					this.sessionId = undefined;
+					this.seq = null;
+				}
+				if (ev.code === 4004) this.client.invalidateToken();
+				this.retry();
+			};
+			ws.onerror = () => this.log("gateway socket error");
 		} catch (e) {
 			this.log(`gateway lookup failed: ${(e as Error).message}`);
-			return this.retry();
-		}
-		const ws = new WebSocket(url);
-		this.ws = ws;
-		ws.onmessage = (ev) => this.handle(String(ev.data));
-		ws.onclose = (ev) => {
-			if (this.ws !== ws) return;
-			if (this.heartbeat) clearInterval(this.heartbeat);
-			this.state = `closed(${ev.code})`;
-			this.log(`gateway closed ${ev.code} ${ev.reason ?? ""}`);
-			// 4004 invalid token, 4006/4007/4009 session invalid -> fresh identify
-			if ([4006, 4007, 4009, 4900, 4901, 4902, 4903, 4904, 4905, 4906, 4907, 4908, 4909, 4910, 4911, 4912, 4913].includes(ev.code)) {
-				this.sessionId = undefined;
-				this.seq = null;
-			}
 			this.retry();
-		};
-		ws.onerror = () => this.log("gateway socket error");
+		} finally {
+			this.opening = false;
+		}
 	}
 
 	private retry(): void {
-		if (this.stopped) return;
+		if (this.stopped || this.retryTimer) return;
 		const d = this.backoff;
 		this.backoff = Math.min(this.backoff * 2, 60_000);
-		setTimeout(() => void this.open(), d);
+		this.state = `retry in ${Math.ceil(d / 1000)}s`;
+		this.retryTimer = setTimeout(() => {
+			this.retryTimer = undefined;
+			void this.open();
+		}, d);
 	}
 
-	private send(p: unknown): void {
-		if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(p));
+	private send(p: unknown): boolean {
+		if (this.ws?.readyState !== WebSocket.OPEN) return false;
+		this.ws.send(JSON.stringify(p));
+		return true;
 	}
 
 	private async handle(raw: string): Promise<void> {
@@ -225,10 +297,18 @@ export class QQGateway {
 			return;
 		}
 		if (typeof p.s === "number") this.seq = p.s;
+		if (p.op === 0 || p.op === 11) this.awaitingAck = false;
 		switch (p.op) {
 			case 10: {
 				if (this.heartbeat) clearInterval(this.heartbeat);
-				this.heartbeat = setInterval(() => this.send({ op: 1, d: this.seq }), p.d?.heartbeat_interval ?? 41_250);
+				this.heartbeat = setInterval(() => {
+					if (this.awaitingAck) {
+						this.log("gateway heartbeat ack timeout");
+						this.ws?.close();
+						return;
+					}
+					if (this.send({ op: 1, d: this.seq })) this.awaitingAck = true;
+				}, p.d?.heartbeat_interval ?? 41_250);
 				const token = `QQBot ${await this.client.getToken()}`;
 				if (this.sessionId && this.seq != null) {
 					this.send({ op: 6, d: { token, session_id: this.sessionId, seq: this.seq } });
@@ -240,9 +320,11 @@ export class QQGateway {
 			case 7: // server asks reconnect
 				this.ws?.close();
 				break;
-			case 9: // invalid session
-				this.sessionId = undefined;
-				this.seq = null;
+			case 9: // invalid session; d=true means resume is still allowed
+				if (p.d !== true) {
+					this.sessionId = undefined;
+					this.seq = null;
+				}
 				this.ws?.close();
 				break;
 			case 0:
@@ -250,7 +332,6 @@ export class QQGateway {
 				break;
 		}
 	}
-
 	private dispatch(t: string, d: any): void {
 		if (t === "READY" || t === "RESUMED") {
 			if (d?.session_id) this.sessionId = d.session_id;

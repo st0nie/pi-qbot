@@ -20,9 +20,9 @@ In the chat log you receive:
 
 ## How to `@`-Mention Someone When Replying
 
-You have two equivalent ways to `@`-mention people in `qq_send`:
+You have two equivalent ways to `@`-mention people in `qq_send` (and in media/sticker captions):
 
-### 1. Using the `at` parameter in `qq_send` (Recommended)
+### 1. Using the `at` parameter (Recommended)
 
 Pass a nickname, a `#N` message reference, or an array of them in `at`:
 
@@ -56,7 +56,7 @@ Or mentioning multiple members at once:
 
 ### 2. Writing `@nickname` directly in `text`
 
-You can also write `@nickname` inline anywhere in `text`, which is especially natural when addressing two people in different parts of one sentence:
+You can also write `@nickname` inline anywhere in `text` or a media `caption`, which is especially natural when addressing two people in different parts of one sentence:
 
 ```json
 {

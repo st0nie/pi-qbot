@@ -1,5 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { basename, extname, join, resolve } from "node:path";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { basename, extname, isAbsolute, join, relative, resolve } from "node:path";
 import {
 	type AgentSession,
 	createAgentSession,
@@ -38,15 +38,35 @@ export interface RefEntry {
 	mentionedMe: boolean;
 	text: string;
 }
+interface SendOptions {
+	replyTo?: number;
+	caption?: string;
+	at?: string | string[];
+}
 
-/** One QQ group / private chat = one directory = one persistent pi session. */
+
+interface PersistedState {
+	version: 1;
+	refSeq: number;
+	sentSeq: number;
+	refs: [number, RefEntry][];
+	sent: [number, { id: string; at: number; preview: string }][];
+	names: [string, string][];
+}
+
+/** One persistent session per QQ chat, with a shared bot workspace/persona across chats. */
 export class Conversation {
+	/** Chat-local attachments, session transcript and reference state. */
 	readonly dir: string;
+	/** Shared cwd for every chat: one bot identity, realctx project, skills and persona. */
+	readonly cwd: string;
 	private session?: AgentSession;
 	private initPromise?: Promise<AgentSession>;
 	private pending: { lines: string[]; images: Image[] } = { lines: [], images: [] };
+	private inboundQueue: Promise<void> = Promise.resolve();
 	private timer?: ReturnType<typeof setTimeout>;
 	private running = false;
+	private retryDelay = 1000;
 	/** Latest inbound msg used as default passive-reply anchor */
 	private anchor?: RefEntry;
 	private names = new Map<string, string>();
@@ -58,6 +78,7 @@ export class Conversation {
 	private sentSeq = 0;
 	private sentThisRun = 0;
 	private lastThinking?: string;
+	private readonly statePath: string;
 	readonly stickers: StickerLibrary;
 
 	constructor(
@@ -67,16 +88,62 @@ export class Conversation {
 		private readonly qq: QQClient,
 		readonly log: Log,
 	) {
-		this.dir = resolve(cfg.root, type === "group" ? "groups" : "users", convId);
+		this.cwd = resolve(cfg.root);
+		this.dir = resolve(this.cwd, type === "group" ? "groups" : "users", convId);
+		this.statePath = join(this.dir, ".state.json");
 		mkdirSync(join(this.dir, "inbox"), { recursive: true });
-		this.stickers = new StickerLibrary(cfg.root);
-		const memo = join(this.dir, "MEMORY.md");
-		if (!existsSync(memo)) writeFileSync(memo, "# Memory\n\n(Members, nicknames, running jokes, agreements.)\n");
+		this.stickers = new StickerLibrary(this.cwd);
+		this.loadState();
 	}
 
+	private loadState(): void {
+		try {
+			if (!existsSync(this.statePath)) return;
+			const s = JSON.parse(readFileSync(this.statePath, "utf8")) as PersistedState;
+			if (s.version !== 1) return;
+			this.refSeq = Number.isInteger(s.refSeq) ? s.refSeq : 0;
+			this.sentSeq = Number.isInteger(s.sentSeq) ? s.sentSeq : 0;
+			this.refs = new Map((Array.isArray(s.refs) ? s.refs : []).filter(([n, r]) => Number.isInteger(n) && r && typeof r.id === "string"));
+			this.sent = new Map((Array.isArray(s.sent) ? s.sent : []).filter(([n, r]) => Number.isInteger(n) && r && typeof r.id === "string"));
+			this.names = new Map((Array.isArray(s.names) ? s.names : []).filter(([id, name]) => typeof id === "string" && typeof name === "string"));
+			this.anchor = [...this.refs.values()].sort((a, b) => b.at - a.at)[0];
+		} catch (e) {
+			this.log(`[${this.tag}] state restore failed: ${(e as Error).message}`);
+		}
+	}
+
+	private persistState(): void {
+		const state: PersistedState = {
+			version: 1,
+			refSeq: this.refSeq,
+			sentSeq: this.sentSeq,
+			refs: [...this.refs],
+			sent: [...this.sent],
+			names: [...this.names].slice(-300),
+		};
+		const tmp = `${this.statePath}.${process.pid}.tmp`;
+		try {
+			writeFileSync(tmp, JSON.stringify(state));
+			renameSync(tmp, this.statePath);
+		} catch (e) {
+			this.log(`[${this.tag}] state save failed: ${(e as Error).message}`);
+		} finally {
+			if (existsSync(tmp)) rmSync(tmp, { force: true });
+		}
+	}
+
+	get tag(): string {
+		return this.convId.slice(0, 8);
+	}
 	// ---------- inbound ----------
 
-	async push(m: InboundMessage): Promise<void> {
+	push(m: InboundMessage): Promise<void> {
+		const result = this.inboundQueue.then(() => this.accept(m));
+		this.inboundQueue = result.catch(() => {});
+		return result;
+	}
+
+	private async accept(m: InboundMessage): Promise<void> {
 		if (m.authorName) this.names.set(m.authorId, m.authorName);
 		for (const men of m.mentions) if (men.name && !men.isMe) this.names.set(men.id, men.name);
 		const ref = ++this.refSeq;
@@ -92,16 +159,16 @@ export class Conversation {
 		this.anchor = entry;
 		this.refs.set(ref, entry);
 		if (this.refs.size > 500) this.refs.delete(this.refs.keys().next().value!);
+		this.persistState();
 		const line = await this.format(m, ref);
-		this.pending.lines.push(line.text);
-		this.log(`[${this.convId.slice(0, 8)}] ${line.text.slice(0, 140)}`);
+		this.pending.lines.push(`[chat ${this.type}:${this.tag}] ${line.text}`);
+		this.log(`[${this.tag}] ${line.text.slice(0, 140)}`);
 		this.pending.images.push(...line.images);
 		// Answer faster when directly addressed or quoted; otherwise wait a bit to batch chatter.
 		const delay = m.mentionedMe || line.quotedMe || this.type === "c2c" ? 600 : this.cfg.debounceMs;
 		if (this.timer) clearTimeout(this.timer);
 		this.timer = setTimeout(() => void this.flush(), delay);
 	}
-
 	private async format(m: InboundMessage, ref: number): Promise<{ text: string; images: Image[]; quotedMe: boolean }> {
 		const time = new Date(m.timestamp).toLocaleTimeString("en-GB", { hour12: false, timeZone: "Asia/Shanghai" });
 		let content = decodeFaces(m.text)
@@ -112,40 +179,35 @@ export class Conversation {
 				return `@${men?.name ?? this.names.get(id) ?? id.slice(0, 8)}`;
 			});
 		const images: Image[] = [];
-		for (const a of m.attachments) {
+		for (const [index, a] of m.attachments.entries()) {
 			if (a.contentType === "voice") {
 				content += a.asr ? ` [voice: ${a.asr}]` : " [voice]";
 				continue;
 			}
 			if (!a.url) continue;
 			try {
-				const isImg = a.contentType.startsWith("image/");
-				const limit = isImg ? MAX_IMAGE_BYTES : MAX_FILE_BYTES;
+				const claimedImage = /^image(?:\/|$)/.test(a.contentType);
+				const limit = claimedImage ? MAX_IMAGE_BYTES : MAX_FILE_BYTES;
 				if (a.size && a.size > limit) {
 					content += ` [file ${a.filename} too large, not downloaded]`;
 					continue;
 				}
 				const res = await fetchTrustedMedia(a.url);
 				if (!res.ok) throw new Error(`HTTP ${res.status}`);
-				const buf = new Uint8Array(await res.arrayBuffer());
-				if (buf.byteLength > limit) throw new Error("too large");
+				const buf = await readResponseLimited(res, limit);
+				const detected = sniffMedia(buf);
+				const kind = detected?.kind ?? (claimedImage ? "image" : a.contentType.startsWith("video/") ? "video" : "file");
 				const safe = basename(a.filename).replace(/[^\w.\-\u4e00-\u9fa5]/g, "_") || "file";
-				const ext = extname(safe) || (isImg ? `.${a.contentType.split("/")[1] || "png"}` : "");
-				const path = join(this.dir, "inbox", `${Date.now()}-${safe.replace(/\.[^.]*$/, "")}${ext}`);
+				const ext = detected?.ext ?? (extname(safe) || (claimedImage ? ".png" : ""));
+				const stem = basename(safe, extname(safe)).slice(0, 80) || "file";
+				const path = join(this.dir, "inbox", `${Date.now()}-${ref}-${index + 1}-${stem}${ext}`);
 				writeFileSync(path, buf);
-				const rel = path.slice(this.dir.length + 1);
-				if (isImg) {
-					// Lazy: the model opens it with the read tool only when it cares (saves tokens and
-					// keeps the persisted session small).
-					content += ` [image ${rel}]`;
-				} else if (a.contentType.startsWith("video/")) {
-					content += ` [video ${rel}]`;
-				} else {
-					content += ` [file ${rel}]`;
-				}
+				const rel = relative(this.cwd, path);
+				// Lazy: the model opens images/files with read/shell only when relevant.
+				content += ` [${kind} ${rel}]`;
 			} catch (e) {
 				content += ` [attachment ${a.filename} download failed]`;
-				this.log(`attachment download failed: ${(e as Error).message}`);
+				this.log(`[${this.tag}] attachment download failed: ${(e as Error).message}`);
 			}
 		}
 		let quoteText = m.quote;
@@ -187,7 +249,12 @@ export class Conversation {
 			if (s?.isStreaming) {
 				const batch = this.takePending();
 				const images = s.model?.input?.includes("image") ? batch.images : [];
-				await s.steer(batch.text, images.length ? images : undefined).catch((e) => this.log(`steer failed: ${e}`));
+				try {
+					await s.steer(batch.text, images.length ? images : undefined);
+				} catch (e) {
+					this.requeue(batch);
+					this.log(`[${this.tag}] steer failed: ${(e as Error).message}`);
+				}
 			}
 			return;
 		}
@@ -198,7 +265,8 @@ export class Conversation {
 			try {
 				session = await this.ensureSession();
 			} catch (e) {
-				this.log(`[${this.convId.slice(0, 8)}] session init failed: ${(e as Error).message}`);
+				this.log(`[${this.tag}] session init failed: ${(e as Error).message}`);
+				this.scheduleRetry();
 				return;
 			}
 			const canSee = !!session.model?.input?.includes("image");
@@ -207,8 +275,13 @@ export class Conversation {
 				this.sentThisRun = 0;
 				try {
 					await session.prompt(batch.text, canSee && batch.images.length ? { images: batch.images } : undefined);
+					this.retryDelay = 1000;
 				} catch (e) {
-					this.log(`[${this.convId.slice(0, 8)}] prompt failed: ${(e as Error).message}`);
+					// Keep the chat batch for a later retry instead of silently losing it.
+					this.requeue(batch);
+					this.log(`[${this.tag}] prompt failed: ${(e as Error).message}`);
+					this.scheduleRetry();
+					return;
 				}
 				// A steer that landed after the agent loop's last check is still queued; recover it
 				// (pi's queue keeps only text, so images of that batch are dropped) plus any new batch.
@@ -223,6 +296,17 @@ export class Conversation {
 		if (this.pending.lines.length && !this.timer) void this.flush();
 	}
 
+	private scheduleRetry(): void {
+		if (this.timer) clearTimeout(this.timer);
+		const wait = this.retryDelay;
+		this.retryDelay = Math.min(this.retryDelay * 2, 60_000);
+		this.timer = setTimeout(() => void this.flush(), wait);
+	}
+
+	private requeue(batch: { text: string; images: Image[] }): void {
+		if (batch.text) this.pending.lines.unshift(batch.text);
+		if (batch.images.length) this.pending.images.unshift(...batch.images);
+	}
 	private takePending(): { text: string; images: Image[] } {
 		const b = this.pending;
 		this.pending = { lines: [], images: [] };
@@ -243,14 +327,15 @@ export class Conversation {
 
 	private async createSession(): Promise<AgentSession> {
 		const agentDir = getAgentDir();
-		const settingsManager = SettingsManager.create(this.dir, agentDir);
-		const memoPath = join(this.dir, "MEMORY.md");
+		const settingsManager = SettingsManager.create(this.cwd, agentDir);
+		const personaPath = join(this.cwd, "PERSONA.md");
+		const sharedPersona = existsSync(personaPath) ? readFileSync(personaPath, "utf8") : "";
 		const resourceLoader = new DefaultResourceLoader({
-			cwd: this.dir,
+			cwd: this.cwd,
 			agentDir,
 			settingsManager,
 			additionalSkillPaths: builtinSkillPaths(),
-			appendSystemPrompt: [personaPrompt(this.cfg, this.type)],
+			appendSystemPrompt: [personaPrompt(this.cfg, this.type, this.tag, sharedPersona, relative(this.cwd, this.dir))],
 			// Never recursively load this bridge inside conversation sessions.
 			extensionsOverride: (base) => ({
 				...base,
@@ -260,36 +345,30 @@ export class Conversation {
 				skills: base.skills.filter((s) => s.name !== "run-workflow"),
 				diagnostics: base.diagnostics,
 			}),
-			agentsFilesOverride: (base) => {
-				const files = base.agentsFiles.filter((f) => resolve(f.path) !== memoPath);
-				if (existsSync(memoPath)) files.push({ path: memoPath, content: readFileSync(memoPath, "utf8") });
-				return { agentsFiles: files };
-			},
 		});
 		await resourceLoader.reload();
 		const { session } = await createAgentSession({
-			cwd: this.dir,
+			cwd: this.cwd,
 			agentDir,
 			settingsManager,
 			resourceLoader,
-			// Persistent per-chat session: resumes the latest one after a restart.
-			// Images are not inlined (models read inbox/ on demand), so files stay small.
-			sessionManager: SessionManager.continueRecent(this.dir, join(this.dir, ".sessions")),
+			// Separate transcripts, but one shared cwd/project/persona across all chats.
+			// Existing <chat>/.sessions files are resumed in place during the migration.
+			sessionManager: SessionManager.continueRecent(this.cwd, join(this.dir, ".sessions")),
 			customTools: this.tools(),
 		});
 		await session.bindExtensions({});
-		const tag = this.convId.slice(0, 8);
 		session.subscribe((ev: any) => {
 			if (ev.type === "tool_execution_start" && !String(ev.toolName).startsWith("qq_send")) {
-				this.log(`[${tag}] 🔧 ${ev.toolName} ${JSON.stringify(ev.args ?? {}).slice(0, 80)}`);
+				this.log(`[${this.tag}] 🔧 ${ev.toolName} ${JSON.stringify(ev.args ?? {}).slice(0, 80)}`);
 			} else if (ev.type === "message_end" && ev.message?.role === "assistant") {
 				const thought = (ev.message.content ?? [])
 					.filter((c: any) => c.type === "text")
 					.map((c: any) => c.text)
 					.join(" ")
 					.trim();
-				if (thought) this.log(`[${tag}] 💭 ${thought.replace(/\s+/g, " ").slice(0, 100)}`);
-				if (ev.message.errorMessage) this.log(`[${tag}] ❌ ${ev.message.errorMessage.slice(0, 120)}`);
+				if (thought) this.log(`[${this.tag}] 💭 ${thought.replace(/\s+/g, " ").slice(0, 100)}`);
+				if (ev.message.errorMessage) this.log(`[${this.tag}] ❌ ${ev.message.errorMessage.slice(0, 120)}`);
 			}
 		});
 		await this.applyRuntime(session);
@@ -297,7 +376,7 @@ export class Conversation {
 		// so messages that piled up mid-run reach the model together.
 		session.setSteeringMode("all");
 		session.setFollowUpMode("all");
-		this.log(`[${this.convId.slice(0, 8)}] session ready (${session.model?.provider}/${session.model?.id}, thinking ${session.thinkingLevel}) at ${this.dir}`);
+		this.log(`[${this.tag}] session ready (${session.model?.provider}/${session.model?.id}, thinking ${session.thinkingLevel}) at ${this.dir}`);
 		return session;
 	}
 
@@ -355,6 +434,7 @@ export class Conversation {
 		const n = ++this.sentSeq;
 		this.sent.set(n, { id: res.id, at: Date.now(), preview: preview.slice(0, 40) });
 		if (this.sent.size > 50) this.sent.delete(this.sent.keys().next().value!);
+		this.persistState();
 		return n;
 	}
 
@@ -365,6 +445,7 @@ export class Conversation {
 		if (Date.now() - m.at > 2 * 60 * 1000) return `s${key} is older than 2 minutes; QQ no longer allows recalling it`;
 		await this.qq.recall(this.type, this.convId, m.id);
 		this.sent.delete(key);
+		this.persistState();
 		this.log(`[${this.convId.slice(0, 8)}] recalled s${key}: ${m.preview}`);
 		return `recalled s${key}`;
 	}
@@ -422,14 +503,24 @@ export class Conversation {
 		return `${missing.map((n) => `@${n}`).join(" ")} ${encoded}`.trim();
 	}
 
-	async sendLocal(path: string, kind: "image" | "file" | "video"): Promise<number | undefined> {
-		const abs = resolve(this.dir, path);
+	async sendLocal(path: string, kind: "image" | "file" | "video", options: SendOptions = {}): Promise<{ sid?: number; quoted: boolean }> {
+		const abs = resolveMediaPath(path, this.cwd, this.dir);
+		const stat = statSync(abs);
+		if (!stat.isFile()) throw new Error(`not a file: ${path}`);
+		const limit = kind === "image" ? MAX_IMAGE_BYTES : MAX_FILE_BYTES;
+		if (stat.size > limit) throw new Error(`file is ${stat.size} bytes; QQ ${kind} limit is ${limit}`);
 		const data = readFileSync(abs);
+		const detected = sniffMedia(data);
+		if (kind === "image" && detected?.kind !== "image") throw new Error("not a recognized png/jpg/gif/webp image");
+		if (kind === "video" && detected && detected.kind !== "video") throw new Error(`expected video, detected ${detected.mime}`);
 		const fileType = kind === "image" ? 1 : kind === "video" ? 2 : 4;
 		const info = await this.qq.uploadMedia(this.type, this.convId, fileType, { data: data.toString("base64") });
-		const { msgId, seq } = this.nextSeq();
-		const res = await this.qq.sendMedia(this.type, this.convId, info, msgId ?? "", seq);
-		return this.remember(res, `[${kind} ${basename(path)}]`);
+		const target = options.replyTo ? this.refs.get(options.replyTo) : undefined;
+		const { msgId, seq } = this.nextSeq(target);
+		const caption = this.applyAtMentions(options.caption ?? "", options.at).slice(0, 1000);
+		const res = await this.qq.sendMedia(this.type, this.convId, info, msgId ?? "", seq, caption, target?.id);
+		const sid = this.remember(res, `[${kind} ${basename(abs)}]${caption ? ` ${caption}` : ""}`);
+		return { sid, quoted: !!target };
 	}
 
 	/** Simulate human typing latency between consecutive messages. */
@@ -473,11 +564,18 @@ export class Conversation {
 			defineTool({
 				name: "qq_send_image",
 				label: "QQ Send Image",
-				description: "Send a local image (png/jpg/gif) to the current QQ chat. path may be relative to the working directory or absolute.",
-				parameters: Type.Object({ path: Type.String() }),
+				description: "Send a local png/jpg/gif/webp image. Paths may be relative to the shared bot workspace, current chat directory, or absolute. Supports an optional caption and quote-reply.",
+				parameters: Type.Object({
+					path: Type.String(),
+					caption: Type.Optional(Type.String({ description: "Optional text sent with the image" })),
+					reply_to: Type.Optional(Type.Integer({ description: "#N message to quote-reply" })),
+					at: Type.Optional(Type.Union([Type.String(), Type.Array(Type.String())], { description: "Nickname(s) or #N ref(s) to @ in the caption" })),
+				}),
 				async execute(_id, params) {
-					const sid = await conv.sendLocal(params.path, "image");
-					return ok(`image sent${sid ? ` as s${sid}` : ""}`);
+					await conv.typingDelay(params.caption ?? "");
+					const r = await conv.sendLocal(params.path, "image", { caption: params.caption, replyTo: params.reply_to, at: params.at });
+					conv.log(`[${conv.tag}] -> ${conv.cfg.name}: [image ${basename(params.path)}]`);
+					return ok(`image sent${r.sid ? ` as s${r.sid}` : ""}${params.reply_to && !r.quoted ? " (quote target unknown)" : ""}`);
 				},
 			}),
 			defineTool({
@@ -504,16 +602,20 @@ export class Conversation {
 			defineTool({
 				name: "qq_send_sticker",
 				label: "QQ Send Sticker",
-				description:
-					"Send a sticker from the shared library by name (or keywords; best match is used). Use it like a real person reacting with a meme.",
-				parameters: Type.Object({ name: Type.String() }),
+				description: "Send a shared-library sticker by exact name or keywords. Supports an optional caption and quote-reply.",
+				parameters: Type.Object({
+					name: Type.String(),
+					caption: Type.Optional(Type.String()),
+					reply_to: Type.Optional(Type.Integer({ description: "#N message to quote-reply" })),
+					at: Type.Optional(Type.Union([Type.String(), Type.Array(Type.String())])),
+				}),
 				async execute(_id, params) {
 					const s = conv.stickers.find(params.name);
 					if (!s) return ok("sticker not found; try qq_find_sticker");
-					await conv.typingDelay("");
-					const sid = await conv.sendLocal(conv.stickers.path(s), "image");
-					conv.log(`[${conv.convId.slice(0, 8)}] -> ${conv.cfg.name}: [sticker ${s.name}]`);
-					return ok(`sent sticker ${s.name}${sid ? ` as s${sid}` : ""}`);
+					await conv.typingDelay(params.caption ?? "");
+					const r = await conv.sendLocal(conv.stickers.path(s), "image", { caption: params.caption, replyTo: params.reply_to, at: params.at });
+					conv.log(`[${conv.tag}] -> ${conv.cfg.name}: [sticker ${s.name}]`);
+					return ok(`sent sticker ${s.name}${r.sid ? ` as s${r.sid}` : ""}${params.reply_to && !r.quoted ? " (quote target unknown)" : ""}`);
 				},
 			}),
 			defineTool({
@@ -528,7 +630,7 @@ export class Conversation {
 					tags: Type.Optional(Type.Array(Type.String())),
 				}),
 				async execute(_id, params) {
-					const s = conv.stickers.save(resolve(conv.dir, params.path), {
+					const s = conv.stickers.save(resolveMediaPath(params.path, conv.cwd, conv.dir), {
 						name: params.name,
 						desc: params.desc,
 						tags: params.tags ?? [],
@@ -540,12 +642,19 @@ export class Conversation {
 			defineTool({
 				name: "qq_send_file",
 				label: "QQ Send File",
-				description: "Send a local file to the current QQ chat (group file sending may be restricted by the platform). Use this for mp4 videos too.",
-				parameters: Type.Object({ path: Type.String() }),
+				description: "Send a local file (mp4/mov/webm uses QQ video upload; other files use file upload). Paths may be shared-workspace-relative, chat-relative, or absolute. Supports caption and quote-reply.",
+				parameters: Type.Object({
+					path: Type.String(),
+					caption: Type.Optional(Type.String()),
+					reply_to: Type.Optional(Type.Integer({ description: "#N message to quote-reply" })),
+					at: Type.Optional(Type.Union([Type.String(), Type.Array(Type.String())])),
+				}),
 				async execute(_id, params) {
-					const kind = /\.mp4$/i.test(params.path) ? "video" : "file";
-					const sid = await conv.sendLocal(params.path, kind);
-					return ok(`file sent${sid ? ` as s${sid}` : ""}`);
+					const kind = /\.(mp4|mov|webm)$/i.test(params.path) ? "video" : "file";
+					await conv.typingDelay(params.caption ?? "");
+					const r = await conv.sendLocal(params.path, kind, { caption: params.caption, replyTo: params.reply_to, at: params.at });
+					conv.log(`[${conv.tag}] -> ${conv.cfg.name}: [${kind} ${basename(params.path)}]`);
+					return ok(`${kind} sent${r.sid ? ` as s${r.sid}` : ""}${params.reply_to && !r.quoted ? " (quote target unknown)" : ""}`);
 				},
 			}),
 		];
@@ -561,9 +670,75 @@ export class Conversation {
 
 	async dispose(): Promise<void> {
 		if (this.timer) clearTimeout(this.timer);
+		await this.inboundQueue;
+		this.persistState();
 		this.session?.dispose();
 		this.session = undefined;
 	}
+}
+
+function resolveMediaPath(path: string, cwd: string, chatDir: string): string {
+	if (isAbsolute(path)) return resolve(path);
+	const shared = resolve(cwd, path);
+	if (existsSync(shared)) return shared;
+	const local = resolve(chatDir, path);
+	return existsSync(local) ? local : shared;
+}
+
+export interface DetectedMedia {
+	kind: "image" | "video" | "audio";
+	mime: string;
+	ext: string;
+}
+
+/** Sniff common QQ media instead of trusting an attacker-controlled filename/content_type. */
+export function sniffMedia(b: Uint8Array): DetectedMedia | undefined {
+	const ascii = (at: number, n: number) => Buffer.from(b.subarray(at, at + n)).toString("ascii");
+	if (b.length >= 8 && b[0] === 0x89 && ascii(1, 3) === "PNG") return { kind: "image", mime: "image/png", ext: ".png" };
+	if (b.length >= 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return { kind: "image", mime: "image/jpeg", ext: ".jpg" };
+	if (b.length >= 6 && (ascii(0, 6) === "GIF87a" || ascii(0, 6) === "GIF89a")) return { kind: "image", mime: "image/gif", ext: ".gif" };
+	if (b.length >= 12 && ascii(0, 4) === "RIFF" && ascii(8, 4) === "WEBP") return { kind: "image", mime: "image/webp", ext: ".webp" };
+	if (b.length >= 12 && ascii(4, 4) === "ftyp") {
+		return ascii(8, 4) === "qt  " ? { kind: "video", mime: "video/quicktime", ext: ".mov" } : { kind: "video", mime: "video/mp4", ext: ".mp4" };
+	}
+	if (b.length >= 4 && b[0] === 0x1a && b[1] === 0x45 && b[2] === 0xdf && b[3] === 0xa3) return { kind: "video", mime: "video/webm", ext: ".webm" };
+	if (b.length >= 4 && ascii(0, 4) === "OggS") return { kind: "audio", mime: "audio/ogg", ext: ".ogg" };
+	if (b.length >= 3 && ascii(0, 3) === "ID3") return { kind: "audio", mime: "audio/mpeg", ext: ".mp3" };
+	return undefined;
+}
+
+async function readResponseLimited(res: Response, limit: number): Promise<Uint8Array> {
+	const declared = Number(res.headers.get("content-length"));
+	if (Number.isFinite(declared) && declared > limit) throw new Error(`attachment exceeds ${limit} bytes`);
+	if (!res.body) {
+		const buf = new Uint8Array(await res.arrayBuffer());
+		if (buf.byteLength > limit) throw new Error(`attachment exceeds ${limit} bytes`);
+		return buf;
+	}
+	const reader = res.body.getReader();
+	const chunks: Uint8Array[] = [];
+	let total = 0;
+	try {
+		for (;;) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			total += value.byteLength;
+			if (total > limit) {
+				await reader.cancel();
+				throw new Error(`attachment exceeds ${limit} bytes`);
+			}
+			chunks.push(value);
+		}
+	} finally {
+		reader.releaseLock();
+	}
+	const out = new Uint8Array(total);
+	let offset = 0;
+	for (const chunk of chunks) {
+		out.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	return out;
 }
 
 function isSelf(p?: string): boolean {
@@ -584,9 +759,13 @@ export function isTrustedMediaUrl(raw: string): boolean {
 
 /** Fetch an attachment only after the URL passes the QQ CDN allowlist; redirects are refused. */
 function fetchTrustedMedia(raw: string): Promise<Response> {
-	if (!isTrustedMediaUrl(raw)) return Promise.reject(new Error(`untrusted attachment host: ${raw}`));
-	const url = new URL(raw).toString();
-	return fetch(url, { signal: AbortSignal.timeout(30_000), redirect: "error" });
+	try {
+		if (!isTrustedMediaUrl(raw)) return Promise.reject(new Error(`untrusted attachment host: ${raw}`));
+		const url = new URL(raw).toString();
+		return fetch(url, { signal: AbortSignal.timeout(30_000), redirect: "error" });
+	} catch (e) {
+		return Promise.reject(e);
+	}
 }
 
 /** Turn QQ face/sticker markup like <faceType=6,faceId="0",ext="base64"> into readable text. */

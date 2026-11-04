@@ -1,29 +1,25 @@
 # pi-qbot
 
-A [pi](https://github.com/earendil-works/pi) extension that puts a pi agent into QQ group chats through the **official QQ Bot API** (`api.sgroup.qq.com`). Each group gets its own working directory and its own persistent pi session. The agent behaves like an ordinary group member rather than an assistant.
+A [pi](https://github.com/earendil-works/pi) extension that puts a pi agent into QQ group and private chats through the **official QQ Bot API** (`api.sgroup.qq.com`). All chats share one bot workspace, persona and long-term memory, while each chat keeps an independent session, message history, quote namespace and attachment directory.
 
 ## Features
 
-- **One directory and one session per chat.** Groups map to `groups/<group_openid>/` and private chats to `users/<user_openid>/`. Each has a `MEMORY.md`, an `inbox/` and a `.sessions/` folder, and the session resumes after a restart.
-- **Full pi.** Each per-chat session loads pi's built-in tools plus your installed extensions and skills. pi-qbot itself is never loaded into them.
-- **Human-like chat.**
-  - The model's plain text is never sent. It speaks only through `qq_send`, so it can choose to stay silent.
-  - Incoming messages are debounced into batches, and messages arriving mid-run are steered into the current turn.
-  - Replies have typing-delay pacing, and the system prompt is written as a persona.
-- **Full-message mode.** The bot reads both `GROUP_AT_MESSAGE_CREATE` and `GROUP_MESSAGE_CREATE`, so it sees every message once the group owner enables "receive all messages".
-- **Media.**
-  - Received images and files are saved to `inbox/`. The model opens them with `read` only when it cares.
-  - The bot can send images and files.
-  - Voice messages arrive with QQ's ASR text, and quoted messages are decoded.
-- **Quote replies & `@` mentions.** Each transcript line carries a `#N` number. `qq_send` accepts `reply_to: N` (sent as a `message_reference` and anchored to `#N` when within the passive window) and `at` (`"nickname"` or `"#N"`). Bundled skills (`qq-quote-reply`, `qq-mention`) teach the model when and how to quote-reply and `@`-mention.
-- **Stickers.** A library in `stickers/` is shared by all chats. The tools `qq_find_sticker`, `qq_send_sticker` and `qq_save_sticker` let the bot collect memes from chats, and `scripts/import_tg_stickers.py` imports Telegram sticker packs.
-- **Follows the host.** Chat sessions use the host pi's model and thinking level, and live `/model` or thinking switches propagate to every chat.
+- **One bot, many chats.** `name`, `persona`, optional `PERSONA.md`, skills and the realctx project are shared across every group/C2C chat. The bot does not grow a different personality in each group.
+- **Chat-local routing and state.** Groups map to `groups/<group_openid>/` and private chats to `users/<user_openid>/`. Each has its own `inbox/`, `.sessions/` and `.state.json` (message `#N` refs, sent `sN` ids and nicknames). Transcripts and these mappings resume after a restart, and every incoming line is tagged with its chat.
+- **Full pi.** Chat sessions load pi's built-in tools plus installed extensions and skills. pi-qbot itself is never recursively loaded into them.
+- **Human-like chat.** Plain model text is never sent; the model speaks through QQ tools or stays silent. Incoming messages are batched, mid-run messages are steered into the active turn, and consecutive replies have typing-delay pacing.
+- **Full-message mode.** The bot reads both `GROUP_AT_MESSAGE_CREATE` and `GROUP_MESSAGE_CREATE`, so it sees every message once the group owner enables "receive all messages". Duplicate gateway deliveries are filtered by message id.
+- **Reliable gateway.** Token refresh, safe GET retries, connection timeout, heartbeat-ack monitoring and bounded reconnect backoff are built in. Message POSTs are not blindly retried after network failures, avoiding duplicate replies.
+- **Media.** Attachments are downloaded only from trusted HTTPS QQ CDNs with streaming size limits. PNG/JPEG/GIF/WebP, MP4/MOV/WebM and common audio are identified by magic bytes, so unnamed files still get the right type/extension. Images, stickers, videos and files can be sent with captions.
+- **Quote replies & `@` mentions.** Every incoming line has a chat-local `#N`. `qq_send`, `qq_send_image`, `qq_send_sticker` and `qq_send_file` accept `reply_to: N`; media tools also accept `caption`, and text/captions support `at` (`"nickname"`, `"#N"`, or an array). Bundled `qq-quote-reply` and `qq-mention` skills teach the model the platform behavior.
+- **Stickers.** `stickers/` is shared by all chats. `qq_find_sticker`, `qq_send_sticker` and `qq_save_sticker` support collecting and reusing memes. The index is cached with cross-chat invalidation, searched with field-aware/CJK scoring, and updated atomically. `scripts/import_tg_stickers.py` imports Telegram packs.
+- **Follows the host.** Chat sessions use the host pi's model and thinking level; live `/model` or thinking switches propagate to every chat.
 
 ## Requirements
 
 - pi ≥ 1.4 and Node ≥ 22.19 (or Bun)
-- A QQ bot from [q.qq.com](https://q.qq.com) with its **AppID** and **AppSecret**. The bot must have the group / C2C message intents.
-- Optional: the group owner enables the bot's "接收全部消息" (receive all messages) switch in the group's bot settings. Without it the bot only sees messages that @ it.
+- A QQ bot from [q.qq.com](https://q.qq.com) with its **AppID** and **AppSecret**, and the group/C2C message intents
+- Optional: the group owner enables the bot's "接收全部消息" switch. Without it the bot only sees messages that @ it
 
 ## Quick start
 
@@ -34,7 +30,8 @@ cat > qqbot.json <<'EOF'
 {
   "appId": "YOUR_APP_ID",
   "secret": "YOUR_APP_SECRET",
-  "name": "小Q"
+  "name": "小Q",
+  "persona": "说话自然、简洁，有一点幽默。"
 }
 EOF
 chmod 600 qqbot.json
@@ -47,11 +44,12 @@ The bridge only starts with `--qqbot` (or `/qqbot start` later). Without the fla
 
 | Command | Description |
 |---|---|
-| `/qqbot status` | Gateway state, each chat's directory and its context usage |
-| `/qqbot logs` | Last 30 log lines |
+| `/qqbot status` (or `chats`) | Bot name, gateway state, shared workspace, each chat's directory and context usage |
+| `/qqbot logs [N]` | Last N log lines (default 30, maximum 100) |
 | `/qqbot start` / `/qqbot stop` | Start or stop the bridge in the current pi |
+| `/qqbot restart` | Restart the gateway and all chat sessions; reloads config, `PERSONA.md` and skills |
 
-A live feed widget above the editor shows incoming lines, replies, tool calls and silent "thoughts". The status bar shows the gateway state and per-chat context usage.
+A live feed widget shows incoming lines, replies, tool calls and silent model text. The status bar labels context usage by chat tag, so multiple groups remain distinguishable.
 
 ## Configuration (`qqbot.json`)
 
@@ -59,50 +57,64 @@ A live feed widget above the editor shows incoming lines, replies, tool calls an
 |---|---|---|
 | `appId`, `secret` | – | Bot credentials. Can also come from `QQBOT_APP_ID` / `QQBOT_SECRET` |
 | `sandbox` | `false` | Use the sandbox API. Can also come from `QQBOT_SANDBOX=1` |
-| `root` | cwd | Root for `groups/`, `users/` and `stickers/` |
-| `name` | `QBot` | Name the bot goes by in chat |
-| `persona` | `""` | Extra persona text appended to the system prompt |
+| `root` | cwd | Shared bot workspace plus `groups/`, `users/` and `stickers/` |
+| `name` | `QBot` | Name the bot goes by in every chat |
+| `persona` | `""` | Shared persona text appended to every chat's system prompt |
 | `allowPrivate` | `true` | Answer C2C private chats |
 | `groups` | `[]` | Allowlist of group openids. Empty means all groups |
-| `debounceMs` | `1500` | Quiet window before a batch is sent to the model. @-mentions and private chats use 600 ms |
-| `model`, `thinking` | host | Pin the chat sessions to a model or thinking level instead of following the host |
+| `debounceMs` | `1500` | Quiet window before a batch is sent to the model. @-mentions, quotes and private chats use 600 ms |
+| `model`, `thinking` | host | Pin chat sessions to a model/thinking level instead of following the host |
 
 The file can also live at `.pi/qqbot.json`.
+
+### Shared persona and memory
+
+- Put longer owner-controlled personality text in **`<root>/PERSONA.md`**. It is injected into every chat session. Use `/qqbot restart` after editing it.
+- Durable memories are managed by **realctx** in the shared bot project, not by per-group `MEMORY.md` files. Group-specific memories are tagged with the current chat and path scope; bot-wide identity/preferences are shared.
+- Conversation context is **not** shared between groups. Each session sees only its own transcript. The prompt explicitly forbids leaking one group's messages, jokes, files or private facts into another.
 
 ## Layout of the bot root
 
 ```text
-qqbot.json
-stickers/            shared sticker library (index.json + images)
+qqbot.json             credentials + shared configuration
+PERSONA.md             optional shared long-form persona
+stickers/              shared sticker library (index.json + images)
 groups/<openid>/
-  MEMORY.md          long-term notes, injected into the session context
-  inbox/             received images / files
-  .sessions/         persistent pi session
-users/<openid>/      same, for private chats
+  inbox/               received images / videos / audio / files
+  .sessions/           this group's persistent pi transcript
+  .state.json          this group's #N refs, sent ids and nicknames
+users/<openid>/        same chat-local layout for private chats
 ```
 
 ## Stickers
 
-Import a Telegram pack. You need a bot token from [@BotFather](https://t.me/BotFather):
+Import a Telegram pack (token from [@BotFather](https://t.me/BotFather)):
 
 ```bash
 TG_BOT_TOKEN=... uv run --script scripts/import_tg_stickers.py \
   https://t.me/addstickers/<pack> ~/qqbot-root/stickers
 ```
 
-The importer converts static stickers to png, and video and animated stickers to gif. It downloads in parallel (`TG_WORKERS`, default 8), resumes interrupted runs and merges into `index.json`. To make search work, add a `desc` and `tags` to each entry.
+The importer converts static stickers to png, and video/animated stickers to gif. It downloads in parallel (`TG_WORKERS`, default 8), resumes interrupted runs and merges into `index.json`. Useful `desc` and `tags` fields improve search.
 
 ## Docker
 
-`Dockerfile` builds pi plus pi-qbot, together with the CLIProxyAPI provider, realmem, empty-text-guard, magic-context, web tools, todo and background-tasks extensions. Adjust the `pi install` lines to taste. `deploy/docker-compose.yml` runs it:
+`Dockerfile` installs pi, pi-qbot, CLIProxyAPI, realctx, realtasks, web tools and todo, plus Python/Pillow and ffmpeg for media work. It enables **codemode by default for every session** with this setting in `/root/.pi/agent/settings.json`:
+
+```json
+{ "defaultTools": ["+codemode"] }
+```
+
+This retains the normal tools and adds codemode, letting agents batch tool calls and use classifier/image models through scripts. For a non-Docker installation, use the same setting or run `pi --tools +codemode`.
+
+`deploy/docker-compose.yml` runs the image:
 
 ```text
 <deploy dir>/
   docker-compose.yml
   src/                 this repo
-  data/                bot root (qqbot.json, groups/, stickers/)
-  pi-agent/            cliproxyapi.json, auth.json, models.json, trust.json, realmem/, rpiv-web-tools/
-  cortexkit/           magic-context config + data
+  data/                shared bot root (qqbot.json, PERSONA.md, groups/, stickers/)
+  pi-agent/            provider auth/model/trust config, realctx/, rpiv-web-tools/
 ```
 
 ```bash
@@ -110,30 +122,32 @@ docker compose up -d --build
 docker exec -it pi-qbot tmux attach -t qqbot   # watch / drive; Ctrl-b d to detach
 ```
 
-The extension source and the entrypoint are bind-mounted, so code changes only need `docker compose up -d --force-recreate`. Build args `HTTP(S)_PROXY` in the compose file route the build through a proxy. They are build-time only.
+The extension source, bundled skills and entrypoint are bind-mounted. Source/skill-only updates can use `docker compose restart`; Dockerfile/settings changes require `docker compose up -d --build`. Compose `HTTP(S)_PROXY` build args are build-time only.
 
 ## Platform limitations (QQ official bots)
 
-- **No real @ in groups.** Both `<qqbot-at-user id="…" />` (the documented format) and `<@openid>` render as literal text in group chats. The bot writes `@nickname` as plain text instead.
-- **QQ adds an automatic @.** When the bot replies to a message that @-mentioned it, QQ itself prepends or appends `@sender`, for text and media alike.
-- **No native QQ faces or poke events.** QQ faces can't be sent in groups (the bot uses Unicode emoji or image stickers), and double-click avatar pokes ("拍一拍" / "戳一戳") are never pushed to official bots.
+- **No real @ in groups.** Both `<qqbot-at-user id="…" />` and `<@openid>` render as literal text. The bot writes `@nickname` as plain text instead.
+- **QQ adds an automatic @.** When replying to a message that @-mentioned it, QQ may prepend/append `@sender`, for text and media alike.
+- **No native QQ faces or poke events.** QQ faces cannot be sent in groups (use Unicode emoji/image stickers), and double-click avatar pokes ("拍一拍" / "戳一戳") are not pushed to official bots.
 - **Passive replies only.** A passive reply must anchor to a received message within 5 minutes. Proactive group messages are limited to 4 per month.
-- **URLs need allowlisting.** Messages containing URLs need the domain allowlisted in the q.qq.com console.
+- **URLs need allowlisting.** Message URLs need their domain allowlisted in the q.qq.com console.
 
 ## Security
 
-Every group member can drive a full pi agent, including bash, file access and the network. Run the bot in a container or under a dedicated user, keep secrets out of its reach, and consider restricting tools.
+Every group member can potentially drive a full pi agent, including bash, file access and the network. Run the bot in a container or under a dedicated user, keep secrets out of reach, and restrict tools where appropriate.
 
-Attachment downloads are limited to HTTPS QQ CDN hosts, and redirects are refused.
+The shared workspace is **not a security boundary**: although the prompt isolates chat context and forbids cross-group access, an agent with shell/file tools can technically reach other chat directories. Only put groups that trust each other on one deployment; use separate containers/roots for hard isolation.
 
-Never commit `qqbot.json`.
+Attachment downloads are limited to HTTPS QQ CDN hosts; redirects are refused and bodies are size-limited while streaming. Never commit `qqbot.json` or provider credentials.
 
 ## Development
 
 ```bash
 bun install
-bunx tsc --noEmit
+bun run check        # tsc --noEmit + focused Bun tests
 ```
+
+Tests cover shared-vs-chat-local state, multi-group attribution, quote/mention/media behavior, state restoration, attachment sniffing/limits, QQ auth/retry/gateway mapping, and sticker cache/search. Run them separately with `bun test`.
 
 ## License
 

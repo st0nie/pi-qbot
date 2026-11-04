@@ -1,9 +1,9 @@
 /**
  * pi-qbot: official QQ Bot bridge for pi.
  *
- * Run `pi` in a root directory containing qqbot.json. Every QQ group gets
- * <root>/groups/<group_openid>/ with its own persistent pi session (full
- * built-in tools, extensions, skills). Private chats go to <root>/users/<openid>/.
+ * Run `pi` in a root directory containing qqbot.json. All chats share that
+ * workspace, persona and realctx project, while each group/private chat keeps
+ * its own transcript, refs and inbox under groups/<openid>/ or users/<openid>/.
  */
 import type { Model } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -39,8 +39,9 @@ class Bridge {
 		const line = `${new Date().toLocaleTimeString("en-GB", { hour12: false })} ${s}`;
 		this.logs.push(line.replace(/\s+/g, " "));
 		if (this.logs.length > 300) this.logs.shift();
-		const ctxs = [...this.convs.values()].map((c) => c.usage()).filter(Boolean);
-		this.ui?.setStatus("qqbot", `QQ: ${this.gateway?.state ?? "?"} · ${this.convs.size} chats${ctxs.length ? ` · ctx ${ctxs.join(" ")}` : ""}`);
+		const ctxs = [...this.convs.values()].map((c) => `${c.tag}=${c.usage() ?? "idle"}`);
+		const shown = ctxs.length > 4 ? [...ctxs.slice(0, 4), `+${ctxs.length - 4}`] : ctxs;
+		this.ui?.setStatus("qqbot", `QQ: ${this.gateway?.state ?? "?"} · ${this.convs.size} chats${shown.length ? ` · ${shown.join(" · ")}` : ""}`);
 		// Live chat feed in the host TUI: incoming, replies, tool calls, thoughts.
 		this.ui?.setWidget(
 			"qqbot-feed",
@@ -62,7 +63,7 @@ class Bridge {
 			conv.host = { ...this.host };
 			this.convs.set(key, conv);
 		}
-		void conv.push(m).catch((e) => this.log(`push failed: ${e}`));
+		void conv.push(m).catch((e) => this.log(`[${m.convId.slice(0, 8)}] push failed: ${(e as Error).message}`));
 	}
 
 	async stop(): Promise<void> {
@@ -101,20 +102,38 @@ export default function (pi: ExtensionAPI) {
 	pi.on("thinking_level_select", async (e: any) => G.__piQbot?.setHost({ thinking: e.level }));
 
 	pi.registerCommand("qqbot", {
-		description: "QQ bot: status | logs | stop | start",
+		description: "QQ bot: status | logs [N] | restart | stop | start",
 		handler: async (args, ctx) => {
-			const b = G.__piQbot;
-			const sub = args.trim() || "status";
-			if (sub === "start") {
-				if (b) return ctx.ui.notify("already running", "info");
+			const [sub = "status", ...rest] = (args.trim() || "status").split(/\s+/);
+			let b = G.__piQbot;
+			const launch = (): Bridge | undefined => {
 				const cfg = loadConfig(ctx.cwd);
-				if (!cfg) return ctx.ui.notify("no qqbot.json / QQBOT_APP_ID in cwd", "error");
+				if (!cfg) {
+					ctx.ui.notify("no qqbot.json / QQBOT_APP_ID in cwd", "error");
+					return undefined;
+				}
 				const nb = new Bridge(cfg);
 				nb.ui = ctx.ui;
 				nb.host = { model: ctx.model, thinking: pi.getThinkingLevel() };
 				G.__piQbot = nb;
 				nb.gateway.start();
-				return ctx.ui.notify("qqbot started", "info");
+				nb.log("qqbot starting");
+				return nb;
+			};
+			if (sub === "restart") {
+				if (b) {
+					await b.stop();
+					G.__piQbot = undefined;
+				}
+				b = launch();
+				if (b) return ctx.ui.notify("qqbot restarted", "info");
+				return;
+			}
+			if (sub === "start") {
+				if (b) return ctx.ui.notify("already running", "info");
+				b = launch();
+				if (b) return ctx.ui.notify("qqbot started", "info");
+				return;
 			}
 			if (!b) return ctx.ui.notify("qqbot not running", "warning");
 			if (sub === "stop") {
@@ -123,9 +142,26 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.setStatus("qqbot", undefined);
 				return ctx.ui.notify("qqbot stopped", "info");
 			}
-			if (sub === "logs") return ctx.ui.notify(b.logs.slice(-30).join("\n") || "(no logs)", "info");
-			const chats = [...b.convs.values()].map((c) => `  ${c.type} ${c.usage() ?? "(idle)"} ${c.dir}`).join("\n");
-			ctx.ui.notify(`gateway: ${b.gateway.state}\nchats:\n${chats || "  (none)"}`, "info");
+			if (sub === "logs") {
+				const requested = Number(rest[0] ?? 30);
+				const count = Number.isFinite(requested) ? Math.max(1, Math.min(100, Math.floor(requested))) : 30;
+				return ctx.ui.notify(b.logs.slice(-count).join("\n") || "(no logs)", "info");
+			}
+			if (sub !== "status" && sub !== "chats") return ctx.ui.notify("usage: /qqbot status | logs [N] | restart | stop | start", "warning");
+			const chats = [...b.convs.values()]
+				.map((c) => `  ${c.type}:${c.tag} ${c.usage() ?? "(idle)"} ${c.dir}`)
+				.join("\n");
+			ctx.ui.notify(
+				`bot: ${b.cfg.name}\ngateway: ${b.gateway.state}\nshared workspace/persona: ${b.cfg.root}\nchats:\n${chats || "  (none)"}`,
+				"info",
+			);
 		},
+	});
+
+	pi.on("session_shutdown", async (e) => {
+		// Keep the process-wide bridge across reload/session switches; only quit tears it down.
+		if (e.reason !== "quit" || !G.__piQbot) return;
+		await G.__piQbot.stop();
+		G.__piQbot = undefined;
 	});
 }

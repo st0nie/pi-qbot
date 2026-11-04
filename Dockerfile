@@ -2,7 +2,7 @@
 FROM node:24-trixie-slim
 
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      git ca-certificates curl tini tmux ripgrep fd-find python3 jq \
+      git ca-certificates curl tini tmux ripgrep fd-find python3 python-is-python3 python3-pil ffmpeg jq \
     && ln -s /usr/bin/fdfind /usr/local/bin/fd \
     && rm -rf /var/lib/apt/lists/*
 
@@ -23,7 +23,7 @@ RUN pi install npm:@router-for-me/pi-cliproxyapi-provider \
  && pi install git:github.com/st0nie/realtasks \
  && pi install npm:@juicesharp/rpiv-web-tools \
  && pi install npm:@juicesharp/rpiv-todo \
- && jq '.compaction = {"enabled": false} | .steeringMode = "all" | .followUpMode = "all"' \
+ && jq '.compaction = {"enabled": false} | .steeringMode = "all" | .followUpMode = "all" | .defaultTools = ((.defaultTools // []) + ["+codemode"] | unique)' \
       /root/.pi/agent/settings.json > /tmp/s.json && mv /tmp/s.json /root/.pi/agent/settings.json
 
 # The qqbot extension itself (loaded via `-e`, never by the per-group sessions).

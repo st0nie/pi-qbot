@@ -18,7 +18,9 @@
     ]
   },
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "check": "bun run typecheck && bun test"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

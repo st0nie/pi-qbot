@@ -1,11 +1,11 @@
 ---
 name: qq-quote-reply
-description: Use when replying to a specific message in a QQ chat using quote-reply (reply_to in qq_send), reading incoming (quote ...) annotations, or handling multi-person conversations where messages interleave.
+description: Use when replying to a specific QQ message with reply_to in qq_send, qq_send_image, qq_send_sticker, or qq_send_file, reading incoming quote annotations, or handling interleaved multi-person conversations.
 ---
 
 # Quoting Messages in QQ Chat (`reply_to`)
 
-In QQ group and private chats, every incoming message in your chat log starts with a `#N` reference number:
+Every incoming line starts with `[chat group:TAG]` (or `c2c`) to identify its chat, followed by time and a chat-local `#N` reference number. The examples below omit chat/time prefixes for readability:
 
 ```text
 [21:03:10] #14 阿明(a1b2c3d4): 周末有人去爬山吗？
@@ -15,7 +15,7 @@ In QQ group and private chats, every incoming message in your chat log starts wi
 
 ## How to Send a Quote-Reply
 
-Pass the integer `N` (without `#`) as `reply_to` in `qq_send`:
+Pass the integer `N` (without `#`) as `reply_to` in `qq_send`, `qq_send_image`, `qq_send_sticker`, or `qq_send_file`. Media tools also accept an optional `caption`:
 
 ```json
 {
@@ -23,6 +23,18 @@ Pass the integer `N` (without `#`) as `reply_to` in `qq_send`:
   "reply_to": 16
 }
 ```
+
+For an image/sticker/file, use the same #N and optionally add a caption:
+
+```json
+{
+  "path": "groups/<chat>/inbox/photo.jpg",
+  "caption": "就是这张图",
+  "reply_to": 16
+}
+```
+
+`#N` mappings are restored after a bot restart, but they are always local to the current chat. Never use a number seen in another group.
 
 When `reply_to` is provided:
 - QQ renders your message with a visual quote bubble pointing to message `#16`.
